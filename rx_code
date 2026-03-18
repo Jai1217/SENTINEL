@@ -1,0 +1,170 @@
+#include <SPI.h>
+#include <nRF24L01.h>
+#include <RF24.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// NRF24L01+
+RF24 radio(7, 8);
+const byte address[6] = "00001";
+
+// OLED (SPI mode)
+#define OLED_DC 10
+#define OLED_CS 4
+#define OLED_RST 9
+Adafruit_SSD1306 display(128, 64, &SPI, OLED_DC, OLED_RST, OLED_CS);
+
+// Data variables
+int sweepID = 0;
+int angle = 0;
+int distance = 0;
+int lockFlag = 0;
+int syringeStatus = 0;
+
+// Stats
+unsigned long lastPacketTime = 0;
+int packetsReceived = 0;
+int packetsFailed = 0;
+
+void setup() {
+  Serial.begin(9600);
+  
+  // Initialize OLED
+  if (!display.begin(SSD1306_SWITCHCAPVCC)) {
+    Serial.println("❌ OLED FAILED!");
+    while(1);
+  }
+  
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("SENTINEL RX");
+  display.println("Initializing...");
+  display.display();
+  delay(1000);
+  
+  // Initialize NRF
+  if (!radio.begin()) {
+    Serial.println("❌ NRF FAILED!");
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println("NRF FAILED!");
+    display.display();
+    while(1);
+  }
+  
+  radio.setChannel(108);
+  radio.setPALevel(RF24_PA_MIN);
+  radio.setDataRate(RF24_250KBPS);
+  radio.setAutoAck(false);
+  radio.disableCRC();
+  
+  radio.openReadingPipe(1, address);
+  radio.startListening();
+  
+  Serial.println("✓ RX Ready - Full System");
+  
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println("SENTINEL");
+  display.println("Ready!");
+  display.display();
+  delay(1000);
+}
+
+void loop() {
+  if (radio.available()) {
+    char payload[32];
+    memset(payload, 0, sizeof(payload));
+    radio.read(payload, sizeof(payload));
+    
+    // Parse payload
+    int parsed = sscanf(payload, "%d,%d,%d,%d,%d.", &sweepID, &angle, &distance, &lockFlag, &syringeStatus);
+    
+    if (parsed == 5) {
+      packetsReceived++;
+      lastPacketTime = millis();
+      
+      // Update OLED display
+      updateDisplay();
+      
+      // Forward to Serial (for Processing GUI)
+      Serial.println(payload);
+      
+    } else {
+      packetsFailed++;
+      Serial.print("✗ Parse failed: ");
+      Serial.println(payload);
+    }
+  }
+  
+  // Check if no packets received for 2 seconds
+  if (millis() - lastPacketTime > 2000 && lastPacketTime > 0) {
+    displayNoSignal();
+  }
+}
+
+void updateDisplay() {
+  display.clearDisplay();
+  
+  // Header
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("SENTINEL RADAR");
+  display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
+  
+  // Sweep ID
+  display.setCursor(0, 14);
+  display.print("Sweep: ");
+  display.println(sweepID);
+  
+  // Angle (larger text)
+  display.setTextSize(2);
+  display.setCursor(0, 26);
+  display.print("A:");
+  display.print(angle);
+  display.print((char)247);  // Degree symbol
+  
+  // Distance (larger text)
+  display.setCursor(0, 44);
+  display.print("D:");
+  display.print(distance);
+  display.print("cm");
+  
+  // Status indicators (small)
+  display.setTextSize(1);
+  display.setCursor(100, 14);
+  if (lockFlag) {
+    display.print("LOCK");
+  }
+  
+  display.setCursor(100, 22);
+  if (syringeStatus) {
+    display.print("FIRE");
+  }
+  
+  // Success rate
+  display.setCursor(0, 56);
+  int total = packetsReceived + packetsFailed;
+  if (total > 0) {
+    int successRate = (packetsReceived * 100) / total;
+    display.print("OK:");
+    display.print(successRate);
+    display.print("%");
+  }
+  
+  display.display();
+}
+
+void displayNoSignal() {
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setCursor(10, 20);
+  display.println("NO SIGNAL");
+  display.setTextSize(1);
+  display.setCursor(25, 45);
+  display.println("Check TX");
+  display.display();
+}
