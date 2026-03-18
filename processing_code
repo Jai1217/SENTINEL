@@ -1,0 +1,161 @@
+import processing.serial.*;
+
+Serial myPort;
+
+int sweepID = 0;
+int iAngle = 0;
+int iDistance = 0;
+int lockFlag = 0;
+int syringeStatus = 0;
+
+final int MAX_DISTANCE = 200;
+
+void setup() {
+  size(1200, 700);
+  smooth();
+  
+  // CRITICAL: Change COM5 to your Arduino's port!
+  // Check Tools > Port in Arduino IDE
+  println("Available ports:");
+  printArray(Serial.list());
+  
+  myPort = new Serial(this, "COM5", 9600);
+  myPort.bufferUntil('.');
+}
+
+void draw() {
+  fill(0, 8);
+  noStroke();
+  rect(0, 0, width, height-80);
+  
+  drawRadarBase();
+  drawSweep();
+  drawObjectTrail();
+  drawHUD();
+}
+
+void serialEvent(Serial myPort) {
+  String data = myPort.readStringUntil('.');
+  if (data == null) return;
+  
+  data = trim(data.substring(0, data.length()-1));
+  String[] parts = split(data, ",");
+  
+  if (parts.length == 5) {
+    sweepID = int(parts[0]);
+    iAngle = int(parts[1]);
+    iDistance = int(parts[2]);
+    lockFlag = int(parts[3]);
+    syringeStatus = int(parts[4]);
+  }
+}
+
+void drawRadarBase() {
+  pushMatrix();
+  translate(width/2, height-80);
+  
+  stroke(0, 255, 120);
+  strokeWeight(2);
+  noFill();
+  
+  int r = width - 300;
+  for (int d = 50; d <= 200; d += 50) {
+    float radius = map(d, 0, MAX_DISTANCE, 0, r);
+    arc(0, 0, radius, radius, PI, TWO_PI);
+  }
+  
+  for (int a = 0; a <= 180; a += 30) {
+    float x = r/2 * cos(radians(a));
+    float y = -r/2 * sin(radians(a));
+    line(0, 0, x, y);
+  }
+  
+  popMatrix();
+}
+
+void drawSweep() {
+  pushMatrix();
+  translate(width/2, height-80);
+  
+  float r = width - 300;
+  strokeWeight(4);
+  
+  if(lockFlag == 1) {
+    stroke(255, 255, 0);
+  } else {
+    stroke(0, 255, 120);
+  }
+  
+  float x = (r/2) * cos(radians(iAngle));
+  float y = -(r/2) * sin(radians(iAngle));
+  line(0, 0, x, y);
+  
+  popMatrix();
+}
+
+void drawObjectTrail() {
+  if(iDistance <= 0 || iDistance > MAX_DISTANCE) return;
+  
+  pushMatrix();
+  translate(width/2, height-80);
+  
+  float r = width - 300;
+  float pixDist = map(iDistance, 0, MAX_DISTANCE, 0, r/2);
+  float x1 = pixDist * cos(radians(iAngle));
+  float y1 = -pixDist * sin(radians(iAngle));
+  float x2 = (r/2) * cos(radians(iAngle));
+  float y2 = -(r/2) * sin(radians(iAngle));
+  
+  if(lockFlag == 1) {
+    stroke(255, 0, 0);
+    strokeWeight(8);
+  } else {
+    stroke(255, 80, 80);
+    strokeWeight(5);
+  }
+  
+  line(x1, y1, x2, y2);
+  point(x1, y1);
+  
+  popMatrix();
+}
+
+void drawHUD() {
+  fill(0);
+  noStroke();
+  rect(0, height-70, width, 70);
+  
+  fill(0, 255, 100);
+  textSize(22);
+  text("Sweep: " + sweepID, 40, height-30);
+  text("Angle: " + iAngle + "°", 200, height-30);
+  
+  if (iDistance > 0 && iDistance <= MAX_DISTANCE) {
+    text("Distance: " + iDistance + " cm", 400, height-30);
+  } else {
+    text("Distance: Out of Range", 400, height-30);
+  }
+  
+  if(lockFlag == 1) {
+    fill(255, 255, 0);
+    textSize(24);
+    text("TARGET LOCKED", 800, height-30);
+  } else {
+    fill(0, 255, 100);
+    text("Scanning...", 800, height-30);
+  }
+  
+  textSize(22);
+  if(syringeStatus == 1){
+    fill(255,120,0);
+    text("LAUNCHER: AIMING", 1000, height-30);
+  }
+  else
+  {
+    fill(120,120,120);
+    text("LAUNCHER: IDLE", 1000, height-30);
+  } 
+}
+
+
+//This is Processing code, you can run this in Processing IDE.
