@@ -1,0 +1,457 @@
+#include <SPI.h>
+#include <nRF24L01.h>
+#include <RF24.h>
+#include <Servo.h>
+
+// ==================== RADIO & SERVOS ====================
+RF24 radio(7, 8);
+Servo radarServo;
+Servo launcherServo;
+
+const byte address[6] = "00001";
+
+// ==================== PINS ====================
+const int TRIG_PIN = 2;
+const int ECHO_PIN = 3;
+const int RADAR_SERVO_PIN = 5;
+const int LAUNCHER_SERVO_PIN = 6;
+const int LASER_PIN = A1;
+const int BUZZER_PIN = 4;
+
+// ==================== STATE MACHINE ====================
+enum State { SCANNING, CANDIDATE_FOUND, LOCKED };
+State currentState = SCANNING;
+State previousState = SCANNING;
+
+// ==================== SWEEP ====================
+int angle = 0;
+bool sweepForward = true;
+int sweepID = 0;
+
+// ==================== NEAREST TRACKING ====================
+int nearestDistance = 999;
+int nearestAngle = 0;
+
+// ==================== CANDIDATE ====================
+struct Candidate {
+  int angle;
+  int distance;
+  int detectedInSweep;
+  bool valid;
+};
+Candidate candidate = {0, 0, -1, false};
+
+// ==================== LOCKED TARGET ====================
+struct LockedTarget {
+  int angle;
+  int distance;
+  int consecutiveFailures;
+};
+LockedTarget locked = {0, 0, 0};
+
+// ==================== TIMING ====================
+unsigned long lastMeasure = 0;  // GLOBAL, not static in switch!
+unsigned long buzzerOnTime = 0;
+bool buzzerState = false;
+const int BUZZER_ON_DURATION = 200;
+const int BUZZER_OFF_DURATION = 300;
+const int BUZZER_FREQUENCY = 2500;
+
+// ==================== SETTINGS ====================
+const int MIN_DETECT_DISTANCE = 1;
+const int MAX_DETECT_DISTANCE = 200;
+const int ANGLE_TOLERANCE = 5;
+const int DISTANCE_TOLERANCE = 10;
+const int LOCK_LOST_THRESHOLD = 15;
+const int MAX_CONSECUTIVE_FAILURES = 3;
+const int LOCK_CHECK_INTERVAL = 200;  // Check target every 200ms
+
+// ==================== DISTANCE MEASUREMENT ====================
+long readDistanceRaw() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+  if (duration == 0) return 0;
+  
+  return duration * 0.034 / 2;
+}
+
+int getSmoothedDistance() {
+  long sum = 0;
+  int validCount = 0;
+  
+  for (int i = 0; i < 3; i++) {
+    long d = readDistanceRaw();
+    if (d > 0 && d < 250) {
+      sum += d;
+      validCount++;
+    }
+    delay(5);
+  }
+  
+  if (validCount == 0) return 0;
+  return sum / validCount;
+}
+
+// ==================== SETUP ====================
+void setup() {
+  Serial.begin(9600);
+  
+  radarServo.attach(RADAR_SERVO_PIN);
+  launcherServo.attach(LAUNCHER_SERVO_PIN);
+  radarServo.write(0);
+  launcherServo.write(90);
+  
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  
+  pinMode(LASER_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(LASER_PIN, LOW);
+  noTone(BUZZER_PIN);
+  
+  Serial.println("╔════════════════════════════════════╗");
+  Serial.println("║   SENTINEL AUTONOMOUS TARGETING    ║");
+  Serial.println("║        2-Sweep Lock System         ║");
+  Serial.println("╚════════════════════════════════════╝");
+  Serial.println();
+  
+  if (!radio.begin()) {
+    Serial.println("❌ NRF24L01+ FAILED!");
+    while(1) {
+      tone(BUZZER_PIN, BUZZER_FREQUENCY);
+      delay(100);
+      noTone(BUZZER_PIN);
+      delay(100);
+    }
+  }
+  
+  radio.setChannel(108);
+  radio.setPALevel(RF24_PA_MIN);
+  radio.setDataRate(RF24_250KBPS);
+  radio.setAutoAck(false);
+  radio.disableCRC();
+  radio.openWritingPipe(address);
+  radio.stopListening();
+  
+  Serial.println("✓ System Ready");
+  Serial.println("════════════════════════════════════");
+  Serial.println();
+  
+  // Startup beeps
+  for(int i = 0; i < 3; i++) {
+    tone(BUZZER_PIN, BUZZER_FREQUENCY);
+    delay(150);
+    noTone(BUZZER_PIN);
+    delay(150);
+  }
+  
+  delay(500);
+}
+
+// ==================== NON-BLOCKING BUZZER ====================
+void handleBuzzer() {
+  if (currentState == LOCKED) {
+    unsigned long currentTime = millis();
+    
+    if (buzzerState) {
+      if (currentTime - buzzerOnTime >= BUZZER_ON_DURATION) {
+        noTone(BUZZER_PIN);
+        buzzerState = false;
+        buzzerOnTime = currentTime;
+      }
+    } else {
+      if (currentTime - buzzerOnTime >= BUZZER_OFF_DURATION) {
+        tone(BUZZER_PIN, BUZZER_FREQUENCY);
+        buzzerState = true;
+        buzzerOnTime = currentTime;
+      }
+    }
+  } else {
+    if (buzzerState) {
+      noTone(BUZZER_PIN);
+      buzzerState = false;
+    }
+  }
+}
+
+// ==================== FORWARD DECLARATIONS ====================
+void moveSweep();
+
+// ==================== MAIN LOOP ====================
+void loop() {
+  int distance = 0;
+  int reportAngle = angle;
+  int lockFlag = 0;
+  int syringeStatus = 0;
+  
+  // ✅ STATE ENTRY/EXIT
+  if (currentState != previousState) {
+    
+    // EXIT old state
+    if (previousState == LOCKED) {
+      digitalWrite(LASER_PIN, LOW);
+      noTone(BUZZER_PIN);
+      buzzerState = false;
+    }
+    
+    // ENTER new state
+    if (currentState == LOCKED) {
+      digitalWrite(LASER_PIN, HIGH);
+      
+      // ✅ MOVE SERVOS TO LOCKED POSITION IMMEDIATELY
+      radarServo.write(locked.angle);
+      launcherServo.write(locked.angle);
+      
+      buzzerOnTime = millis();
+      buzzerState = false;
+      lastMeasure = millis();
+    }
+    
+    previousState = currentState;
+  }
+  
+  switch (currentState) {
+    
+    // ==================== STATE: SCANNING ====================
+    case SCANNING:
+      radarServo.write(angle);
+      launcherServo.write(90);
+      delay(15);
+      
+      distance = getSmoothedDistance();
+      
+      if (distance >= MIN_DETECT_DISTANCE && distance <= MAX_DETECT_DISTANCE) {
+        if (distance < nearestDistance) {
+          nearestDistance = distance;
+          nearestAngle = angle;
+        }
+      }
+      
+      moveSweep();
+      break;
+    
+    // ==================== STATE: CANDIDATE_FOUND ====================
+    case CANDIDATE_FOUND:
+      radarServo.write(angle);
+      delay(15);
+      
+      distance = getSmoothedDistance();
+      
+      if (distance >= MIN_DETECT_DISTANCE && distance <= MAX_DETECT_DISTANCE) {
+        if (distance < nearestDistance) {
+          nearestDistance = distance;
+          nearestAngle = angle;
+        }
+      }
+      
+      // VERIFICATION
+      if (sweepID != candidate.detectedInSweep) {
+        if (abs(angle - candidate.angle) <= ANGLE_TOLERANCE) {
+          
+          if (distance >= MIN_DETECT_DISTANCE && 
+              distance <= MAX_DETECT_DISTANCE &&
+              abs(distance - candidate.distance) <= DISTANCE_TOLERANCE) {
+            
+            // ✅ LOCK!
+            locked.angle = candidate.angle;
+            locked.distance = distance;
+            locked.consecutiveFailures = 0;
+            currentState = LOCKED;
+            
+            Serial.println();
+            Serial.println("╔════════════════════════════════════╗");
+            Serial.println("║        ✓ TARGET LOCKED             ║");
+            Serial.println("╚════════════════════════════════════╝");
+            Serial.print("  Angle: ");
+            Serial.print(locked.angle);
+            Serial.println("°");
+            Serial.print("  Distance: ");
+            Serial.print(locked.distance);
+            Serial.println(" cm");
+            Serial.println("════════════════════════════════════");
+            Serial.println();
+            
+            break;
+            
+          } else {
+            // Verification failed
+            candidate.valid = false;
+            candidate.distance = 999;
+            currentState = SCANNING;
+          }
+        }
+      }
+      
+      moveSweep();
+      break;
+    
+    // ==================== STATE: LOCKED ====================
+    case LOCKED:
+      // ✅ KEEP SERVOS LOCKED - NO DELAYS!
+      // Servos were positioned on state entry, just maintain position
+      
+      // Check target periodically (not every loop)
+      if (millis() - lastMeasure >= LOCK_CHECK_INTERVAL) {
+        int checkDistance = getSmoothedDistance();
+        lastMeasure = millis();
+        
+        if (checkDistance == 0) {
+          locked.consecutiveFailures++;
+          
+          if (locked.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+            Serial.println();
+            Serial.println("╔════════════════════════════════════╗");
+            Serial.println("║        ✗ TARGET LOST               ║");
+            Serial.println("╚════════════════════════════════════╝");
+            Serial.println();
+            
+            currentState = SCANNING;
+            candidate.valid = false;
+            candidate.distance = 999;
+            nearestDistance = 999;
+          }
+          
+        } else if (checkDistance >= MIN_DETECT_DISTANCE && 
+                   checkDistance <= MAX_DETECT_DISTANCE &&
+                   abs(checkDistance - locked.distance) <= LOCK_LOST_THRESHOLD) {
+          locked.consecutiveFailures = 0;
+          locked.distance = checkDistance;
+          distance = checkDistance;  // Update for reporting
+          
+        } else {
+          locked.consecutiveFailures++;
+          
+          if (locked.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+            Serial.println();
+            Serial.println("╔════════════════════════════════════╗");
+            Serial.println("║        ✗ TARGET LOST               ║");
+            Serial.println("╚════════════════════════════════════╝");
+            Serial.println();
+            
+            currentState = SCANNING;
+            candidate.valid = false;
+            candidate.distance = 999;
+            nearestDistance = 999;
+          }
+        }
+      } else {
+        // Use stored distance when not measuring
+        distance = locked.distance;
+      }
+      
+      reportAngle = locked.angle;
+      lockFlag = 1;
+      syringeStatus = 1;
+      break;
+  }
+  
+  // ✅ Handle buzzer
+  handleBuzzer();
+  
+  // ==================== TRANSMIT & PRINT ====================
+  char payload[32];
+  sprintf(payload, "%d,%d,%d,%d,%d.", sweepID, reportAngle, distance, lockFlag, syringeStatus);
+  
+  radio.write(payload, strlen(payload) + 1);
+  Serial.println(payload);
+  
+  delay(10);
+}
+
+// ==================== SWEEP MOVEMENT ====================
+void moveSweep() {
+  if (currentState != LOCKED) {
+    if (sweepForward) {
+      angle += 2;
+      if (angle >= 180) {
+        angle = 180;
+        sweepForward = false;
+        sweepID++;
+        
+        if (nearestDistance < 999) {
+          
+          if (!candidate.valid) {
+            candidate.angle = nearestAngle;
+            candidate.distance = nearestDistance;
+            candidate.detectedInSweep = sweepID - 1;
+            candidate.valid = true;
+            currentState = CANDIDATE_FOUND;
+            
+            Serial.println();
+            Serial.print("🎯 CANDIDATE: ");
+            Serial.print(nearestAngle);
+            Serial.print("° @ ");
+            Serial.print(nearestDistance);
+            Serial.println("cm");
+            Serial.println();
+            
+          } else if (currentState == CANDIDATE_FOUND && nearestDistance < candidate.distance) {
+            candidate.angle = nearestAngle;
+            candidate.distance = nearestDistance;
+            candidate.detectedInSweep = sweepID - 1;
+            
+            Serial.println();
+            Serial.print("🔄 UPDATED: ");
+            Serial.print(nearestAngle);
+            Serial.print("° @ ");
+            Serial.print(nearestDistance);
+            Serial.println("cm");
+            Serial.println();
+          }
+        }
+        
+        nearestDistance = 999;
+        nearestAngle = 0;
+      }
+    } else {
+      angle -= 2;
+      if (angle <= 0) {
+        angle = 0;
+        sweepForward = true;
+        sweepID++;
+        
+        if (nearestDistance < 999) {
+          
+          if (!candidate.valid) {
+            candidate.angle = nearestAngle;
+            candidate.distance = nearestDistance;
+            candidate.detectedInSweep = sweepID - 1;
+            candidate.valid = true;
+            currentState = CANDIDATE_FOUND;
+            
+            Serial.println();
+            Serial.print("🎯 CANDIDATE: ");
+            Serial.print(nearestAngle);
+            Serial.print("° @ ");
+            Serial.print(nearestDistance);
+            Serial.println("cm");
+            Serial.println();
+            
+          } else if (currentState == CANDIDATE_FOUND && nearestDistance < candidate.distance) {
+            candidate.angle = nearestAngle;
+            candidate.distance = nearestDistance;
+            candidate.detectedInSweep = sweepID - 1;
+            
+            Serial.println();
+            Serial.print("🔄 UPDATED: ");
+            Serial.print(nearestAngle);
+            Serial.print("° @ ");
+            Serial.print(nearestDistance);
+            Serial.println("cm");
+            Serial.println();
+          }
+        }
+        
+        nearestDistance = 999;
+        nearestAngle = 0;
+      }
+    }
+  }
+}
+
+TX Code
